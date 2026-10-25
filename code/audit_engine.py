@@ -332,7 +332,24 @@ class ResolvedResource:
 
 
 def _flat_text(value: Any) -> str:
+    """Render a JSON scalar the way the source artefact spells it.
+
+    ``None`` becomes the literal ``null`` and booleans become ``true``/``false``,
+    so a record's flattened context reads exactly like the document it came from.
+    A redacted field therefore appears as ``email=null`` instead of ``email=None``,
+    and a JSON ``restore_allowed: false`` matches the ``restore_allowed=false``
+    flag the state classifier looks for.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
     return str(value)
+
+
+def _empty_key_sets() -> Dict[str, set]:
+    """A fresh identifier-key bucket (``email`` / ``hash`` / ``phone`` / ``ref``)."""
+    return {"email": set(), "hash": set(), "phone": set(), "ref": set()}
 
 
 def _extract_keys(text: str) -> Dict[str, set]:
@@ -371,19 +388,21 @@ def _record_scalars(node: Dict[str, Any], sink: Dict[str, Any]) -> None:
 
 
 def _iter_json_records(node: Any) -> Iterable[Dict[str, Any]]:
-    """Yield one flattened scalar map per JSON dict node.
+    """Yield one flattened scalar map per JSON dict node, at any depth.
 
-    Lists are descended into separately so that a container of many records
-    never cross-links one record's identifier to another record's resource.
+    A dict is yielded as a flattened scalar record, and only its *scalar* fields
+    are folded into that record: a list is never flattened in, so a container of
+    many records can never cross-link one record's identifier to another record's
+    resource. Every dict and list value is then descended into, which is what
+    reaches the records nested under a container such as
+    ``service_exports.<system>.<collection>[]``.
     """
     if isinstance(node, dict):
         sink: Dict[str, Any] = {}
         _record_scalars(node, sink)
         yield sink
         for value in node.values():
-            if isinstance(value, list):
-                for item in value:
-                    yield from _iter_json_records(item)
+            yield from _iter_json_records(value)
     elif isinstance(node, list):
         for item in node:
             yield from _iter_json_records(item)
@@ -392,6 +411,103 @@ def _iter_json_records(node: Any) -> Iterable[Dict[str, Any]]:
 def _context_from_mapping(mapping: Dict[str, Any]) -> str:
     parts = [f"{key}={_flat_text(value)}" for key, value in sorted(mapping.items())]
     return " ".join(parts)
+
+
+# Correlation token that ties the two halves of a split log record together.
+_TRACE_RE = re.compile(r"\btrace_id=([A-Za-z0-9._\-]+)")
+# ``key=value`` token, used to read a record's own fields out of its context.
+_KEYVALUE_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=([^\s]*)")
+
+# Fields that name a person directly. A record whose own copy of every one of
+# these is empty has had its direct identifiers removed by policy, which is what
+# ``REDACT`` and ``ANONYMIZE`` require (AGENTS.md section 6.5).
+_DIRECT_IDENTIFIER_FIELDS = frozenset(
+    {
+        "name",
+        "full_name",
+        "display_name",
+        "email",
+        "email_hash",
+        "phone",
+        "requester_email",
+        "requester_name",
+        "requester_phone",
+        "owner_email",
+        "owner_phone",
+        "customer_email",
+        "customer_phone",
+    }
+)
+_NULLISH_VALUES = frozenset({"null", "none", "nil", "n/a", "na", '""', "''"})
+
+
+def _nullish_token(token: str) -> bool:
+    """True when a spelled-out field value means "no value"."""
+    return token.strip().strip(",;.").strip("\"'").lower() in _NULLISH_VALUES
+
+
+def _direct_identifiers_cleared(context: str) -> bool:
+    """True when every direct-identifier field present in ``context`` is empty.
+
+    Reads the record's own ``key=value`` fields rather than a fixed phrase, so it
+    recognises a redacted row regardless of how the artefact spells the empty
+    value (``null``, ``None``, ``""``) or which subset of fields it prints. A
+    record that names no direct-identifier field at all is *not* reported as
+    cleared: silence is not proof of redaction.
+    """
+    seen = False
+    for match in _KEYVALUE_RE.finditer(context):
+        if match.group(1).lower() not in _DIRECT_IDENTIFIER_FIELDS:
+            continue
+        seen = True
+        if not _nullish_token(match.group(2)):
+            return False
+    return seen
+
+
+# Tokens that mark a definitive outcome on a record, versus tokens that mark an
+# opening / in-flight trace event. A terminal line decides a record's state, so
+# it must outrank the opening line of the same trace (AGENTS.md section 6.6).
+_TERMINAL_TOKENS: Tuple[str, ...] = (
+    "rows=0",
+    "rows=",
+    "rows_read=",
+    "status_code=",
+    "http_status=",
+    "404",
+    "not_found",
+    "not found",
+    "absent",
+    "marker_found",
+    "deletion_marker",
+    "restore_allowed",
+    "archive_present",
+    "enabled=",
+    "anonymized",
+    "redacted",
+    "blocked",
+    "deleted",
+    "account_status",
+    "result=",
+    "total_hits",
+    "_completed",
+)
+_OPENING_TOKENS: Tuple[str, ...] = (
+    "_started",
+    "started",
+    "attempt=",
+    "connection_acquired",
+    "batch_started",
+    "queued",
+)
+
+
+def _context_weight(context: str) -> int:
+    """Score how decisive a mention's context is, higher meaning more terminal."""
+    lowered = context.lower()
+    score = sum(1 for token in _TERMINAL_TOKENS if token in lowered)
+    score -= sum(1 for token in _OPENING_TOKENS if token in lowered)
+    return score
 
 
 # ---------------------------------------------------------------------------
@@ -497,30 +613,60 @@ class EvidenceCorpus:
         self._ingest_lines(text, file_id, captured_at)
 
     def _ingest_lines(self, text: str, file_id: str, captured_at: str) -> None:
+        """Index one mention per resource named on a line.
+
+        A log record is frequently split over two lines: an opening line that
+        names the subject (``event=..._started lookup_key=<email>``) and a closing
+        line that carries the resource id and the decisive outcome
+        (``event=..._completed resource_id=... rows=0 http_status=404``). Lines
+        that share a ``trace_id`` describe the same request, so a resource line
+        naming no identifier of its own borrows the keys its trace already
+        established rather than being dropped (AGENTS.md section 6.6).
+        """
+        trace_keys: Dict[str, Dict[str, set]] = {}
         for raw_line in text.splitlines():
             line = raw_line.strip()
             if not line:
                 continue
+            own_keys = _extract_keys(line)
+            trace = _TRACE_RE.search(line)
+            if trace is not None and any(own_keys.values()):
+                bucket = trace_keys.setdefault(trace.group(1), _empty_key_sets())
+                for name, values in own_keys.items():
+                    bucket[name] |= values
             resources = _extract_resources(line)
             if not resources:
                 continue
-            identifier_keys = _extract_keys(line)
-            if not any(identifier_keys.values()):
-                continue
+            keys = own_keys
+            if not any(keys.values()):
+                if trace is None:
+                    continue
+                keys = trace_keys.get(trace.group(1), _empty_key_sets())
+                if not any(keys.values()):
+                    continue
             for resource_id in resources:
-                self._emit(line, resource_id, file_id, captured_at)
+                self._emit(line, resource_id, file_id, captured_at, keys=keys)
 
-    def _emit(self, source: Any, resource_id: str, file_id: str, captured_at: str) -> None:
+    def _emit(
+        self,
+        source: Any,
+        resource_id: str,
+        file_id: str,
+        captured_at: str,
+        keys: Optional[Dict[str, set]] = None,
+    ) -> None:
         if isinstance(source, dict):
-            keys = {"email": set(), "hash": set(), "phone": set(), "ref": set()}
-            for value in source.values():
-                found = _extract_keys(_flat_text(value))
-                for name, values in found.items():
-                    keys[name] |= values
             context = _context_from_mapping(source)
+            if keys is None:
+                keys = _empty_key_sets()
+                for value in source.values():
+                    found = _extract_keys(_flat_text(value))
+                    for name, values in found.items():
+                        keys[name] |= values
         else:
-            keys = _extract_keys(str(source))
             context = str(source)
+            if keys is None:
+                keys = _extract_keys(context)
         context = context[:MAX_CONTEXT_CHARS]
         mention = ResourceMention(resource_id, file_id, captured_at, context)
         for name, values in keys.items():
@@ -545,8 +691,13 @@ class EvidenceCorpus:
 
         best: Dict[str, ResourceMention] = {}
         for resource_id, mentions in collected.items():
-            # Most recent admissible proof wins; file_id breaks ties deterministically.
-            best[resource_id] = max(mentions, key=lambda m: (m.captured_at, m.evidence_id))
+            # A definitive terminal line decides the record's state, so it must
+            # outrank the opening line of the same trace. Recency settles equally
+            # decisive evidence, and file_id keeps the choice deterministic.
+            best[resource_id] = max(
+                mentions,
+                key=lambda m: (_context_weight(m.context), m.captured_at, m.evidence_id),
+            )
         return best
 
 
@@ -910,9 +1061,16 @@ class DeletionAuditEngine:
     def rules(self) -> List[Rule]:
         return list(self._rules)
 
-    def action_for_category(self, category: str) -> str:
-        """Required action for ``category``, falling back to the record's own kind."""
-        return self._action_by_category.get(category, "DELETE")
+    def action_for_category(self, category: str, default: str = "DELETE") -> str:
+        """Required action for ``category``, falling back to ``default``.
+
+        ``deletion_rules.csv`` does not cover every category: it has no
+        ``DATA_FLOW`` row, because an active connector is a recreation risk
+        rather than a storable record. For a category the policy is silent about,
+        the caller passes the resource catalogue's own action so a data flow is
+        still judged as a flow and not as a record to delete.
+        """
+        return self._action_by_category.get(category, default)
 
     # -- per-case pipeline -------------------------------------------------
 
@@ -1029,7 +1187,7 @@ class DeletionAuditEngine:
         prefix = mention.prefix
         if prefix not in RESOURCE_KINDS:
             return ResolvedResource(mention, compliant=True, verification_operation="")
-        action = self.action_for_category(mention.category)
+        action = self.action_for_category(mention.category, mention.action)
         context = mention.context
         absent = (
             _flag(context, "404")
@@ -1038,7 +1196,11 @@ class DeletionAuditEngine:
             or _flag(context, "rows=0")
             or _flag(context, "absent")
         )
-        anonymized = _flag(context, "anonymized") or _flag(context, "no direct identifier")
+        anonymized = (
+            _flag(context, "anonymized")
+            or _flag(context, "no direct identifier")
+            or _direct_identifiers_cleared(context)
+        )
         blocked = (
             _flag(context, "restore_allowed=false")
             or _flag(context, "restore_allowed=0")
@@ -1052,8 +1214,11 @@ class DeletionAuditEngine:
             or _flag(context, "stopped")
             or _flag(context, "inactive")
         )
-        redacted = _flag(context, "redacted") or _flag(context, "requester_email=null") or _flag(
-            context, "requester_email=none"
+        redacted = (
+            _flag(context, "redacted")
+            or _flag(context, "requester_email=null")
+            or _flag(context, "requester_email=none")
+            or _direct_identifiers_cleared(context)
         )
 
         if action == "DISABLE_FLOW":
