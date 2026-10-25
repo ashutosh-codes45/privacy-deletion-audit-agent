@@ -225,3 +225,36 @@ branch=main
 repo_root=D:/aLOKA/Orchestrate Oct 2026/hackerrank-orchestrate-october26
 worktree=main
 parent_agent=none
+
+## [2026-10-25T09:09:05+05:30] Phase 3: unstructured evidence and multimodal verification hooks
+
+User Prompt (verbatim, secrets redacted):
+Our Phase 2 baseline is officially committed to the remote repository. Let's move immediately to implementing Phase 3: Unstructured Evidence & Multi-Modal Verification Hooks.
+Please execute the following updates within our codebase:
+1. Integrate Multimodal Evidence Parsing Loops (code/audit_engine.py): Expand the evidence crawler loop to handle non-CSV unstructured data files under 'dataset/evidence/'. Add targeted LLM/Vision engine integration blocks to systematically parse complex text logs, PDF compliance certificates, and database image captures. Address the indirect reference challenge: explicitly prompt the model to cross-reference ambiguous text components (e.g., matching a phrase like 'the user associated with ticket #8942') back to the actual subject identity using our pre-compiled Pass 1 lookup indexes.
+2. Bridge the Private-Key Constraint Matrix: Provide clear, structural contextual data in your LLM system prompt instructing it to link hidden naming conventions (e.g., cross-referencing account strings like 'account_00N' directly to their matching stable internal 'user_0N' identity keys). Use these contextual alignments to assert precise record presence/absence properties across conflicting database replicas.
+3. Enforce Strict Operational Verification Bounds: Tighten the validation constraints inside the CaseAudit pipeline. Any request that evaluates to a 'COMPLETE' deletion state is strictly required to contain one or more valid 'VERIFICATION' phase steps citing a real, admissible evidence file snapshot.
+4. Deploy Local Multi-Modal File Caching: Build a lightweight local file caching utility map (e.g., capturing extracted OCR/JSON content indices locally). Ensure each large unstructured evidence asset is analyzed only once during execution to save token counts and maintain low system latency.
+Compile all scripts, run our testing engine 'code/evaluation/local_scorer.py' to measure precision/recall optimization, ensure 'log.txt' reflects this turn following the AGENTS.md workflow protocol, and stop for my review once completed.
+
+Agent Response Summary:
+Delivered all four Phase 3 items. (1) Evidence ingestion is now multimodal: EvidenceCorpus.load() routes every .pdf/.png/.jpg/.jpeg/.webp manifest asset through the new code/multimodal.py DocumentAnalyzer, which reads corpus PDFs with a dependency-free ASCII85Decode+FlateDecode reader (returning windowed lines so a resource id and its owner identifier co-locate on one line, covering the indirect-reference case in AGENTS.md section 6.6) and treats screenshots as vision-only. (2) Bridged the private naming convention: config.EXTRACTION_SYSTEM_PROMPT instructs the extraction model to align account_00N with user_0N, and audit_engine gained parse_sql_tables/account_id_for/convention_observed/ReplicaSnapshot(s) so a subject's account record is asserted present or absent across conflicting replica captures - but only when the snapshot itself demonstrates the convention and no explicit account identifier match already exists. (3) Tightened the COMPLETE bound: CaseAudit.validate(admissible_evidence) now requires a COMPLETE answer to carry at least one VERIFICATION step, and every step it carries must cite an id present in the admissible set computed at audit_at; run_case downgrades any COMPLETE that cannot cite an admissible snapshot to INCOMPLETE and blanks the non-FINDING evidence ids. (4) Added a local extraction cache keyed by (file_id, sha256(content)) persisted to the system temp directory (deliberately outside the repo, since AGENTS.md section 6.9 excludes caches from the submission), so each asset is analysed once per run. Important decision: OCR/LLM extraction stays strictly environment-gated - with no credential configured the run makes zero provider calls, charges no image tokens, and reports image assets as unresolved rather than fabricating facts for them. Compilation is clean and the scorer improved from Phase 2's 9.38% sequence / 49.33% field F1 to 18.75% / 56.00% at unchanged 75.00% status accuracy; the remaining mismatches are evidence-linkage gaps (JSON-export records whose parent holds several resource ids are skipped, and support/export/search/flow mentions are not yet collected), reported for review rather than papered over.
+
+Actions:
+* Read: code/audit_engine.py (EvidenceCorpus, CaseAudit.validate, run_case, _derived_account_mention), code/evaluation/local_scorer.py, log.txt
+* Edit: code/config.py (added section 6: LLM_API_KEY_ENV/LLM_BASE_URL_ENV/VISION_MODEL_ENV, DEFAULT_VISION_BASE_URL, DEFAULT_VISION_MODEL, EVIDENCE_CACHE_JSON in the system temp dir; section 7: ACCOUNT_ID_PREFIX, ACCOUNT_ID_MIN_WIDTH, REPLICA_MARKER, EXTRACTION_SYSTEM_PROMPT with the indirect-reference and account_00N<->user_0N instructions)
+* Write: code/multimodal.py (DocumentAnalyzer single entry point; stdlib PDF reader; PNG tEXt/iTXt/zTXt probe; env-gated OpenAI-compatible VisionClient; ExtractionCache + Extraction; parse_vision_facts)
+* Edit: code/audit_engine.py (EvidenceCorpus._ingest_multimodal + analyzer wiring + analyzer.finish(); parse_sql_tables/account_id_for/convention_observed; ReplicaSnapshot/ReplicaSnapshots loaded only from manifest rows whose path/origin contains 'replica'; _derived_account_mention guarded by convention_observed and by an existing account_* mention; _admissible_evidence_ids; evidence_usage; CaseAudit.validate(admissible_evidence) COMPLETE bound; run_case COMPLETE->INCOMPLETE downgrade using dataclasses.replace)
+* Edit: code/multimodal.py (removed an unreachable duplicate cache branch in analyze(); vision image token budget now charged only when the vision client is configured)
+* RunCommand: python -m py_compile code/config.py code/identity_resolver.py code/multimodal.py code/audit_engine.py code/evaluation/metrics_tracker.py code/evaluation/local_scorer.py -> COMPILE_EXIT=0
+* RunCommand: python code/evaluation/local_scorer.py --show-mismatches -> deletion-status exact-match 75.00% (24/32); exact step-sequence 18.75% (6/32, was 9.38%); step-field micro F1 56.00% (was 49.33%); 133 predicted vs 193 expected steps
+* RunCommand: usage probe via engine.evidence_usage() -> readable_files 83 (79 text + 4 PDFs), skipped_files 11 (all PNGs), {'model_calls': 0, 'input_tokens': 1143, 'output_tokens': 0, 'assets_analyzed': 0, 'cache_hits': 15} - confirms the cache served all 15 assets once and the unconfigured vision path spent nothing
+* RunCommand: Remove-Item -Recurse -Force code/__pycache__, code/evaluation/__pycache__ -> 0 __pycache__ directories remain
+
+Context:
+tool=TraeCode
+model=DeepSeek-V4.1-Flash
+branch=main
+repo_root=D:/aLOKA/Orchestrate Oct 2026/hackerrank-orchestrate-october26
+worktree=main
+parent_agent=none

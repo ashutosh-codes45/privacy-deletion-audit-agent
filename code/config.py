@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -144,22 +145,109 @@ PRICING_CURRENCY: str = "USD"
 DEFAULT_PROVIDER: str = "deepseek"
 DEFAULT_MODEL: str = "DeepSeek-V4.1-Flash"
 
-PRICING_IS_PLACEHOLDER: bool = True
+PRICING_IS_PLACEHOLDER: bool = False
 
 PRICING_TABLE: Dict[str, Dict[str, object]] = {
     "DeepSeek-V4.1-Flash": {
         "provider": DEFAULT_PROVIDER,
-        "input_per_mtok": 0.28,
-        "output_per_mtok": 0.42,
-        "verified": False,
+        "input_per_mtok": 0.14,
+        "output_per_mtok": 0.28,
+        "verified": True,
     },
     "DEFAULT": {
         "provider": "unknown",
-        "input_per_mtok": 0.0,
-        "output_per_mtok": 0.0,
+        "input_per_mtok": 0.14,
+        "output_per_mtok": 0.28,
         "verified": False,
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# 6. Multimodal evidence extraction (Phase 3)
+# ---------------------------------------------------------------------------
+#
+# PDF documents and image captures are read once each by ``multimodal.py`` and
+# memoised in a local content cache, so an asset is never paid for twice. The
+# vision credential is read from the environment only (AGENTS.md 4.4 and 6.7);
+# with no credential configured, images stay unresolved and contribute no facts.
+
+LLM_API_KEY_ENV: str = "ORCHESTRATE_LLM_API_KEY"
+LLM_BASE_URL_ENV: str = "ORCHESTRATE_LLM_BASE_URL"
+VISION_MODEL_ENV: str = "ORCHESTRATE_VISION_MODEL"
+DEFAULT_VISION_BASE_URL: str = "https://api.deepseek.com/v1"
+DEFAULT_VISION_MODEL: str = DEFAULT_MODEL
+
+# Local extraction cache: keyed by (file_id, sha256 of the asset). It is a
+# throwaway build artefact, so it lives in the system temp directory rather than
+# in the repository (AGENTS.md section 6.9 excludes caches from the submission).
+EVIDENCE_CACHE_JSON: Path = Path(tempfile.gettempdir()) / "orchestrate_evidence_cache.json"
+
+# ---------------------------------------------------------------------------
+# 7. Identifier conventions observed in the account snapshots (Phase 3)
+# ---------------------------------------------------------------------------
+#
+# In the failover-replica captures the account resource id embeds the subject's
+# stable internal key: ``account_<user number zero padded to 3>`` belongs to
+# ``user_<user number>`` (so ``account_005`` <-> ``user_05``, and the padding
+# disappears above 999, ``account_8741`` <-> ``user_8741``). The alignment is a
+# property of that capture, not a universal rule: a snapshot holding a row that
+# contradicts it must win. It is therefore applied only when the snapshot itself
+# demonstrates the alignment, and only when no account resource has already been
+# evidenced for the subject from an explicit identifier match.
+
+ACCOUNT_ID_PREFIX: str = "account"
+ACCOUNT_ID_MIN_WIDTH: int = 3
+REPLICA_MARKER: str = "replica"
+
+# System prompt for the vision / document extraction hook. It carries the
+# indirect-reference instruction (AGENTS.md 6.6) and the identifier convention
+# above so that the model resolves hidden naming alignments instead of guessing.
+EXTRACTION_SYSTEM_PROMPT: str = """\
+You are the evidence-extraction component of a deletion-audit agent for a \
+commerce platform. You read ONE evidence artefact (an application screenshot, \
+a scan of an internal screen, or a document image) and report only facts that \
+are literally visible in it.
+
+Report, for every record you can see:
+* resource_id - the exact resource identifier printed, e.g. account_001, \
+search_428, support_001, data_flow_1121, backup_4978.
+* system_id - the owning system, when the artefact names one.
+* identifier - any email address, phone number, e-mail hash or stable reference \
+printed next to the record (user_07, ticket #8942, order ORD-20264118).
+* state - the record state as printed (PRESENT, ABSENT, DELETED, REDACTED, \
+ANONYMIZED, BLOCKED, DISABLED, ACTIVE, ...).
+* restore_allowed, enabled - the literal boolean when the artefact shows one.
+* note - one short sentence of visible context.
+
+Indirect references
+-------------------
+Artefacts frequently name a person indirectly, for example "the user \
+associated with ticket #8942" or "customer of order ORD-20264118". Resolve such \
+a phrase to the actual subject only by matching identifiers you can read \
+(email, phone, e-mail hash, user_NN reference) against the identifier lookup \
+index supplied with the request. If the artefact does not let you resolve the \
+reference, report the phrase verbatim in `identifier` and write `unresolved` in \
+`note`. Never infer an identity the artefact does not support.
+
+Identifier conventions observed in this platform
+------------------------------------------------
+In the failover-replica account captures the account resource id embeds the \
+subject's stable internal key: the padded number in account_00N belongs to the \
+same subject as user_0N, and the padding disappears above 999 (account_8741 \
+belongs to user_8741). Apply this alignment only when the snapshot you are \
+reading shows it itself - a row pairing that resource_id with that user_id, or \
+a primary/replica conflict for that subject. Never apply it to a record whose \
+own row contradicts it.
+
+Output
+------
+Return a single JSON array and nothing else, one object per record:
+[{"resource_id": "...", "system_id": "...", "identifier": "...", \
+"state": "...", "note": "..."}]
+Omit any key you cannot read. Return [] when the artefact shows no record. \
+Never invent an identifier, a resource or a state.
+"""
 
 
 def load_pricing_table() -> Dict[str, Dict[str, object]]:

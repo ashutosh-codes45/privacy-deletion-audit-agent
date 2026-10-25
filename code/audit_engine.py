@@ -30,8 +30,17 @@ This module implements the deterministic baseline:
    ``system_activity.csv`` to locate the resources that still hold the subject's
    data, mapped onto the allowed FINDING / REMEDIATION / VERIFICATION steps.
 
-No LLM or vision hooks are present: image and PDF evidence is enumerated in the
-manifest but its pixels/typography are not read by this baseline.
+Phase 3 additions
+-----------------
+4. the evidence crawler also ingests the **unstructured** assets (PDF documents
+   and image captures) through :mod:`multimodal`, which parses each asset once
+   and memoises the result in a local content cache;
+5. the account identifier convention seen in the failover-replica captures is
+   applied as an explicitly guarded alignment, so a subject's account record can
+   be asserted present or absent *across conflicting replica tables*;
+6. ``COMPLETE`` is only ever reported with at least one ``VERIFICATION`` step
+   that cites a real, admissible evidence snapshot captured at or before the
+   case's ``audit_at``; when no such proof exists the case is not complete.
 """
 
 from __future__ import annotations
@@ -40,19 +49,21 @@ import csv
 import json
 import re
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 try:  # imported as part of the ``code`` package
     import config
     import identity_resolver as identity
+    import multimodal
 except ImportError:  # pragma: no cover - direct script execution
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import config
     import identity_resolver as identity
+    import multimodal
 
 
 # ---------------------------------------------------------------------------
@@ -229,8 +240,16 @@ class CaseAudit:
             "steps_json": serialize_steps(self.steps),
         }
 
-    def validate(self) -> None:
-        """Raise ``ValueError`` if the answer violates the output contract."""
+    def validate(self, admissible_evidence: Optional[Set[str]] = None) -> None:
+        """Raise ``ValueError`` if the answer violates the output contract.
+
+        ``admissible_evidence`` is the set of evidence ids (``file_id`` /
+        ``activity_id``) captured at or before the case's ``audit_at``. When it
+        is supplied, a ``COMPLETE`` answer is held to the Phase 3 bound: it must
+        carry at least one ``VERIFICATION`` step, and every step it carries must
+        cite an id from that set, so a completion can never be claimed without a
+        real, admissible snapshot behind it (AGENTS.md sections 6.5 and 6.6).
+        """
         if self.deletion_status not in config.DELETION_STATUSES:
             raise ValueError(f"unknown deletion_status {self.deletion_status!r}")
         if self.deletion_status == "NOT_APPLICABLE":
@@ -246,11 +265,18 @@ class CaseAudit:
         if ranks != sorted(ranks):
             raise ValueError(f"{self.case_id}: phases are out of order")
         if self.deletion_status == "COMPLETE":
+            if not self.steps:
+                raise ValueError(f"{self.case_id}: COMPLETE requires at least one verification step")
             for step in self.steps:
                 if step.phase != "VERIFICATION":
                     raise ValueError(f"{self.case_id}: COMPLETE may only contain VERIFICATION steps")
                 if not step.evidence_id:
                     raise ValueError(f"{self.case_id}: COMPLETE verification must cite evidence")
+                if admissible_evidence is not None and step.evidence_id not in admissible_evidence:
+                    raise ValueError(
+                        f"{self.case_id}: COMPLETE cites {step.evidence_id!r}, which is not an "
+                        "admissible evidence snapshot at audit_at"
+                    )
 
 
 def serialize_steps(steps: Sequence[AuditStep]) -> str:
@@ -374,15 +400,26 @@ def _context_from_mapping(mapping: Dict[str, Any]) -> str:
 
 
 class EvidenceCorpus:
-    """The manifest plus a reverse index from identifier key to resource mentions."""
+    """The manifest plus a reverse index from identifier key to resource mentions.
 
-    def __init__(self, manifest_csv: Path = config.EVIDENCE_FILES_CSV) -> None:
+    Text-shaped evidence (``.sql``/``.log``/``.json``/``.txt``/``.csv``/... ) is
+    read directly. PDF documents and image captures are routed through
+    :mod:`multimodal`, which extracts their text once and caches it, so the
+    unstructured assets are ingested into the same index as everything else.
+    """
+
+    def __init__(
+        self,
+        manifest_csv: Path = config.EVIDENCE_FILES_CSV,
+        analyzer: Optional[multimodal.DocumentAnalyzer] = None,
+    ) -> None:
         self.manifest_csv = Path(manifest_csv)
         self.files: Dict[str, Dict[str, str]] = {}
         self._index: Dict[Tuple[str, str], List[ResourceMention]] = defaultdict(list)
         self._loaded = False
         self.readable_files = 0
         self.skipped_files: List[str] = []
+        self.analyzer = analyzer if analyzer is not None else multimodal.DocumentAnalyzer()
 
     # -- loading -----------------------------------------------------------
 
@@ -401,10 +438,15 @@ class EvidenceCorpus:
         for file_id in sorted(self.files):
             meta = self.files[file_id]
             path = config.DATASET_DIR / meta["file_path"]
-            if path.suffix.lower() not in TEXT_EVIDENCE_SUFFIXES:
+            if not path.is_file():
                 self.skipped_files.append(file_id)
                 continue
-            if not path.is_file() or path.stat().st_size > MAX_EVIDENCE_BYTES:
+            suffix = path.suffix.lower()
+            if suffix in multimodal.MULTIMODAL_SUFFIXES:
+                if not self._ingest_multimodal(file_id, path, meta["captured_at"]):
+                    self.skipped_files.append(file_id)
+                continue
+            if suffix not in TEXT_EVIDENCE_SUFFIXES or path.stat().st_size > MAX_EVIDENCE_BYTES:
                 self.skipped_files.append(file_id)
                 continue
             try:
@@ -413,10 +455,25 @@ class EvidenceCorpus:
                 self.skipped_files.append(file_id)
                 continue
             self.readable_files += 1
-            self._ingest(text, path.suffix.lower(), file_id, meta["captured_at"])
+            self._ingest(text, suffix, file_id, meta["captured_at"])
 
+        self.analyzer.finish()
         self._loaded = True
         return self
+
+    def _ingest_multimodal(self, file_id: str, path: Path, captured_at: str) -> bool:
+        """Read one PDF/image asset and index the lines it yields.
+
+        An asset the reader cannot resolve (an image with no text and no vision
+        provider) contributes nothing: the audit reports what was actually read
+        rather than inventing a fact for it.
+        """
+        extraction = self.analyzer.analyze(file_id, path)
+        if not extraction.lines:
+            return False
+        self.readable_files += 1
+        self._ingest_lines("\n".join(extraction.lines), file_id, captured_at)
+        return True
 
     def _ensure_loaded(self) -> None:
         if not self._loaded:
@@ -592,6 +649,149 @@ class ActivityLog:
 
 
 # ---------------------------------------------------------------------------
+# Replica snapshots (SQL dump evidence) and the account identifier convention
+# ---------------------------------------------------------------------------
+
+_SQL_CREATE_RE = re.compile(r"CREATE\s+TABLE\s+\"?([A-Za-z_]\w*)\"?\s*\((.*?)\)\s*;", re.S)
+_SQL_INSERT_RE = re.compile(r"INSERT\s+INTO\s+\"?([A-Za-z_]\w*)\"?\s*VALUES\s*\((.*?)\)\s*;", re.S)
+_SQL_COLUMN_RE = re.compile(
+    r"([A-Za-z_]\w*)\s+(?:TEXT|INTEGER|INT|REAL|NUMERIC|BLOB|VARCHAR\w*|TIMESTAMP|BOOLEAN|DATE)",
+    re.I,
+)
+_SQL_VALUE_RE = re.compile(r"'([^']*)'")
+
+
+def parse_sql_tables(text: str) -> Dict[str, List[Dict[str, str]]]:
+    """Parse a SQLite-compatible dump into ``{table: [{column: value}]}``.
+
+    The column order is taken from each ``CREATE TABLE`` statement, which is what
+    makes the positional ``INSERT`` values interpretable. Anything unrecognised
+    is skipped rather than guessed; a snapshot that does not parse simply
+    contributes no rows.
+    """
+    tables: Dict[str, List[Dict[str, str]]] = {}
+    columns: Dict[str, List[str]] = {}
+    for name, body in _SQL_CREATE_RE.findall(text):
+        columns[name] = [match.group(1) for match in _SQL_COLUMN_RE.finditer(body)]
+        tables.setdefault(name, [])
+    for name, body in _SQL_INSERT_RE.findall(text):
+        values = _SQL_VALUE_RE.findall(body)
+        names = columns.get(name, [])
+        row = {column: values[index] for index, column in enumerate(names) if index < len(values)}
+        if row:
+            tables.setdefault(name, []).append(row)
+    return tables
+
+
+def account_id_for(user_id: str) -> str:
+    """Return the account resource id the replica convention pairs with ``user_id``.
+
+    ``user_05`` -> ``account_005``; ``user_8741`` -> ``account_8741`` (the padding
+    only applies below 1000). Returns ``""`` when ``user_id`` carries no number.
+    """
+    digits = (user_id or "").rsplit("_", 1)[-1]
+    if not user_id or not user_id.startswith("user_") or not digits.isdigit():
+        return ""
+    width = config.ACCOUNT_ID_MIN_WIDTH
+    return f"{config.ACCOUNT_ID_PREFIX}_{int(digits):0{width}d}"
+
+
+def convention_observed(tables: Dict[str, List[Dict[str, str]]]) -> bool:
+    """True when a snapshot itself pairs ``account_<padded n>`` rows with ``user_<n>``.
+
+    This is the guard that keeps the naming convention from being applied where
+    the data contradicts it: a capture whose rows pair a subject with some other
+    account id teaches us nothing, and derivation is then refused.
+    """
+    for rows in tables.values():
+        for row in rows:
+            user_id = row.get("user_id", "")
+            resource_id = row.get("resource_id", "")
+            if account_id_for(user_id) and resource_id == account_id_for(user_id):
+                return True
+    return False
+
+
+@dataclass(frozen=True)
+class ReplicaSnapshot:
+    """One replica/primary capture: the tables it holds and when it was taken."""
+
+    file_id: str
+    captured_at: str
+    origin: str
+    tables: Dict[str, List[Dict[str, str]]]
+
+    def subject_account(self, user_id: str) -> Optional[Tuple[str, Dict[str, str]]]:
+        """Return ``(resource_id, row)`` when this capture still holds the subject."""
+        for rows in self.tables.values():
+            for row in rows:
+                if row.get("user_id") == user_id:
+                    return row.get("resource_id", ""), row
+        return None
+
+
+class ReplicaSnapshots:
+    """The subset of the evidence manifest that holds database snapshots.
+
+    Only captures whose path or origin names a replica are read: those are the
+    artefacts that expose replication drift, and therefore the ones that let a
+    record be asserted present or absent across conflicting copies
+    (AGENTS.md section 6.6).
+    """
+
+    def __init__(
+        self,
+        manifest_csv: Path = config.EVIDENCE_FILES_CSV,
+        dataset_dir: Path = config.DATASET_DIR,
+    ) -> None:
+        self.manifest_csv = Path(manifest_csv)
+        self.dataset_dir = Path(dataset_dir)
+        self.snapshots: Dict[str, ReplicaSnapshot] = {}
+        self._loaded = False
+
+    def load(self) -> "ReplicaSnapshots":
+        with open(self.manifest_csv, "r", encoding=config.CSV_ENCODING, newline="") as fh:
+            manifest = [dict(row) for row in csv.DictReader(fh)]
+        for row in sorted(manifest, key=lambda item: (item.get("file_id") or "")):
+            file_id = (row.get("file_id") or "").strip()
+            if not file_id:
+                continue
+            file_path = (row.get("file_path") or "").strip()
+            origin = (row.get("origin") or "").strip()
+            marker = config.REPLICA_MARKER
+            if marker not in file_path.lower() and marker not in origin.lower():
+                continue
+            path = self.dataset_dir / file_path
+            if not path.is_file():
+                continue
+            try:
+                text = path.read_text(encoding=config.CSV_ENCODING, errors="replace")
+            except OSError:
+                continue
+            self.snapshots[file_id] = ReplicaSnapshot(
+                file_id=file_id,
+                captured_at=(row.get("captured_at") or "").strip(),
+                origin=origin,
+                tables=parse_sql_tables(text),
+            )
+        self._loaded = True
+        return self
+
+    def _ensure_loaded(self) -> None:
+        if not self._loaded:
+            self.load()
+
+    def admissible(self, at: Optional[str]) -> List[ReplicaSnapshot]:
+        """Captures taken at or before ``at``, in deterministic order."""
+        self._ensure_loaded()
+        return [
+            self.snapshots[file_id]
+            for file_id in sorted(self.snapshots)
+            if identity._is_admissible(self.snapshots[file_id].captured_at, at)
+        ]
+
+
+# ---------------------------------------------------------------------------
 # Policy
 # ---------------------------------------------------------------------------
 
@@ -672,6 +872,7 @@ class DeletionAuditEngine:
         self.resolver = identity.IdentityResolver(identities_csv, audit_log_csv)
         self.corpus = EvidenceCorpus(self.evidence_manifest_csv)
         self.activity = ActivityLog(self.activity_csv)
+        self.replicas = ReplicaSnapshots(self.evidence_manifest_csv)
         self._loaded = False
 
     # -- setup -------------------------------------------------------------
@@ -695,6 +896,7 @@ class DeletionAuditEngine:
         self.resolver.load()
         self.corpus.load()
         self.activity.load()
+        self.replicas.load()
         self._evidence_index = dict(self.corpus.files)
         self._loaded = True
 
@@ -757,6 +959,70 @@ class DeletionAuditEngine:
                 ResourceMention(resource_id, activity_id, event_time, details[:MAX_CONTEXT_CHARS]),
             )
         return mentions
+
+    def _derived_account_mention(
+        self,
+        user_id: Optional[str],
+        mentions: Dict[str, ResourceMention],
+        at: Optional[str],
+    ) -> Optional[ResourceMention]:
+        """Assert the subject's account record from a replica capture.
+
+        The failover-replica captures embed the subject's stable key in the
+        account id (``account_005`` <-> ``user_05``, ``account_8741`` <->
+        ``user_8741``). The alignment is applied only when the capture itself
+        demonstrates it, and only when no account resource has already been
+        evidenced for the subject from an explicit identifier match. The capture
+        then decides the record's state: present when it still holds a row for
+        the subject, absent when the row is gone - which is exactly the
+        replication-drift question (AGENTS.md section 6.6).
+        """
+        candidate = account_id_for(user_id or "")
+        if not candidate:
+            return None
+        if any(resource_id.startswith(f"{config.ACCOUNT_ID_PREFIX}_") for resource_id in mentions):
+            return None
+        for snapshot in self.replicas.admissible(at):
+            if not convention_observed(snapshot.tables):
+                continue
+            found = snapshot.subject_account(user_id or "")
+            if found is not None:
+                resource_id, row = found
+                context = " ".join(f"{name}={value}" for name, value in sorted(row.items()))
+            else:
+                resource_id = candidate
+                context = (
+                    f"replica snapshot {snapshot.file_id} holds no row for {user_id}: "
+                    f"{resource_id} absent"
+                )
+            return ResourceMention(
+                resource_id, snapshot.file_id, snapshot.captured_at, context[:MAX_CONTEXT_CHARS]
+            )
+        return None
+
+    def _admissible_evidence_ids(self, at: Optional[str]) -> Set[str]:
+        """Every evidence id (``file_id`` / ``activity_id``) usable at ``at``.
+
+        A ``COMPLETE`` answer may only cite ids from this set, which is what
+        makes "verified at ``audit_at``" checkable rather than asserted.
+        """
+        self._ensure_loaded()
+        ids: Set[str] = {
+            file_id
+            for file_id, meta in self.corpus.files.items()
+            if identity._is_admissible(meta.get("captured_at", ""), at)
+        }
+        ids |= {
+            row.get("activity_id", "")
+            for row in self.activity.rows
+            if row.get("activity_id") and identity._is_admissible(row.get("event_time", ""), at)
+        }
+        return ids
+
+    def evidence_usage(self) -> Dict[str, int]:
+        """Multimodal extraction telemetry: calls, tokens, assets, cache hits."""
+        self._ensure_loaded()
+        return self.corpus.analyzer.usage()
 
     def _resolve_resource(self, mention: ResourceMention) -> ResolvedResource:
         """Apply the policy action and the observed state to one resource."""
@@ -954,12 +1220,28 @@ class DeletionAuditEngine:
         if not self.authorizes_deletion(request.get("request_text", "")):
             return CaseAudit(case_id, "NOT_APPLICABLE", [])
 
-        _, keys = self._subject_keys(request, audit_at)
+        user_id, keys = self._subject_keys(request, audit_at)
         mentions = self._collect_mentions(keys, audit_at)
+        derived = self._derived_account_mention(user_id, mentions, audit_at)
+        if derived is not None:
+            mentions.setdefault(derived.resource_id, derived)
         resources = [self._resolve_resource(mention) for mention in mentions.values()]
         status, steps = self._build_steps(resources)
+
+        admissible = self._admissible_evidence_ids(audit_at)
+        if status == "COMPLETE" and not any(step.evidence_id in admissible for step in steps):
+            # Nothing in the manifest, at or before ``audit_at``, proves the
+            # required final state, so the deletion may not be reported as
+            # complete (AGENTS.md section 6.5). The case stays open instead of
+            # asserting a completion the evidence does not support.
+            status = "INCOMPLETE"
+            steps = [
+                step if step.phase == "FINDING" else replace(step, evidence_id="")
+                for step in steps
+            ]
+
         audit = CaseAudit(case_id, status, steps)
-        audit.validate()
+        audit.validate(admissible)
         return audit
 
     # -- sweep -------------------------------------------------------------
@@ -1015,7 +1297,12 @@ __all__ = [
     "DeletionAuditEngine",
     "EvidenceCorpus",
     "ActivityLog",
+    "ReplicaSnapshot",
+    "ReplicaSnapshots",
     "ResourceMention",
     "ResolvedResource",
+    "account_id_for",
+    "convention_observed",
+    "parse_sql_tables",
     "serialize_steps",
 ]
