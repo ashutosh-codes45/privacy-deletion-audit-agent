@@ -1,9 +1,9 @@
 # Usage Report — full_dataset_run
 
-- Run id: `60d035c385e4`
+- Run id: `ecb0d6ce609f`
 - Status: **COMPLETE**
-- Started (UTC): 2026-10-25T03:57:45Z
-- Finished (UTC): 2026-10-25T03:57:49Z
+- Started (UTC): 2026-10-25T10:15:51Z
+- Finished (UTC): 2026-10-25T10:15:55Z
 - Wall-clock duration: 3s
 - Items audited: 518 of 518 expected
 - Items succeeded: 518
@@ -16,14 +16,14 @@
 | Metric | Value |
 | --- | --- |
 | Items measured | 518 |
-| Total audit time | 2.779 s |
-| Average latency per item | 0.005 s |
+| Total audit time | 2.951 s |
+| Average latency per item | 0.006 s |
 | Median (p50) | 0.004 s |
-| p90 | 0.010 s |
-| p95 | 0.011 s |
+| p90 | 0.007 s |
+| p95 | 0.015 s |
 | Fastest item | 0.000 s |
-| Slowest item | 0.032 s |
-| Throughput (mean) | 186.41 items/s |
+| Slowest item | 0.128 s |
+| Throughput (mean) | 175.53 items/s |
 
 ## Token and cost usage by model
 

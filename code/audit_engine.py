@@ -296,6 +296,7 @@ class ResourceMention:
     evidence_id: str
     captured_at: str
     context: str
+    subject_reference: str = ""
 
     @property
     def prefix(self) -> str:
@@ -532,6 +533,7 @@ class EvidenceCorpus:
         self.manifest_csv = Path(manifest_csv)
         self.files: Dict[str, Dict[str, str]] = {}
         self._index: Dict[Tuple[str, str], List[ResourceMention]] = defaultdict(list)
+        self._explicit_subject_references: List[ResourceMention] = []
         self._loaded = False
         self.readable_files = 0
         self.skipped_files: List[str] = []
@@ -668,7 +670,14 @@ class EvidenceCorpus:
             if keys is None:
                 keys = _extract_keys(context)
         context = context[:MAX_CONTEXT_CHARS]
-        mention = ResourceMention(resource_id, file_id, captured_at, context)
+        subject_reference = ""
+        if isinstance(source, dict):
+            value = source.get("subject_reference")
+            if isinstance(value, str):
+                subject_reference = value.strip()
+        mention = ResourceMention(resource_id, file_id, captured_at, context, subject_reference)
+        if subject_reference:
+            self._explicit_subject_references.append(mention)
         for name, values in keys.items():
             for value in values:
                 self._index[(name, value)].append(mention)
@@ -699,6 +708,24 @@ class EvidenceCorpus:
                 key=lambda m: (_context_weight(m.context), m.captured_at, m.evidence_id),
             )
         return best
+
+    def late_subject_reference_mentions(
+        self, user_id: Optional[str], at: Optional[str]
+    ) -> List[ResourceMention]:
+        """Return late JSON records explicitly linked by ``subject_reference``."""
+        self._ensure_loaded()
+        if not user_id or not at:
+            return []
+        return sorted(
+            (
+                mention
+                for mention in self._explicit_subject_references
+                if mention.subject_reference == user_id
+                and mention.captured_at
+                and mention.captured_at > at
+            ),
+            key=lambda mention: (mention.resource_id, mention.captured_at, mention.evidence_id),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1392,6 +1419,15 @@ class DeletionAuditEngine:
             mentions.setdefault(derived.resource_id, derived)
         resources = [self._resolve_resource(mention) for mention in mentions.values()]
         status, steps = self._build_steps(resources)
+        if status == "INCOMPLETE":
+            for mention in self.corpus.late_subject_reference_mentions(user_id, audit_at):
+                if mention.prefix != "audit_record" or mention.resource_id in mentions:
+                    continue
+                resource = self._resolve_resource(mention)
+                if resource.verification_operation == "VERIFY_RECORD_PRESENT":
+                    resources.append(resource)
+                    mentions[mention.resource_id] = mention
+            status, steps = self._build_steps(resources)
 
         admissible = self._admissible_evidence_ids(audit_at)
         if status == "COMPLETE" and not any(step.evidence_id in admissible for step in steps):
